@@ -19,3 +19,5 @@ dist/
 .env*
 
 backup/.venv/
+backup/__pycache__/
+*.pyc
