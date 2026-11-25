@@ -151,53 +151,125 @@ zero-to-tech/
 
 `.venv`、`.env.local`、`backend/.env`、`history.db` 和构建产物由各自运行环境生成。
 
-## 构建与部署
+## 部署到服务器
 
-在项目根目录执行以下命令。
+前提：服务器上已装好 Python 3.10+、Node.js 18+ 和 Nginx。
+
+**1. 拉取代码**
 
 ```bash
-npm run build
+cd ~/zero-to-tech
+git pull
 ```
 
-当前 `next.config.mjs` 配置为 `output: "export"`，构建后将生成 `out/`，可交给 Nginx 或静态托管服务发布。当前模式应通过静态服务器提供 `out/`，`package.json` 中的 `npm start` 使用 `next start`，不适用于该导出模式。静态服务器需要支持将 `/text-lab` 映射到生成的 `text-lab.html`，以便直接访问或刷新该页面。[Next.js 静态导出说明](https://nextjs.org/docs/15/app/guides/static-exports)
+**2. 前端：装依赖、写配置、构建**
 
-前端发布时还需要单独部署 FastAPI，并完成以下配置。
-
-- 构建前将 `NEXT_PUBLIC_API_BASE_URL` 设为用户浏览器可以访问的后端地址。
-- 将前端实际访问的来源加入后端 `ALLOWED_ORIGINS`，修改后重启后端。
-- 为后端保留可写、持久的 SQLite 存储，并在更新或迁移前备份数据库。
-- 在生产环境通过进程管理和反向代理运行后端，使用 HTTPS。后端开发命令中的 `--reload` 应在生产环境移除。
-
-当前会话 Cookie 使用 `SameSite=Lax`。前后端部署在不同站点时，需要根据域名安排评估 Cookie 的 `SameSite`、`Secure` 和浏览器第三方 Cookie 策略，验证分析与历史查询能使用同一会话。
-
-## 常见问题
-
-### 后端启动时报 `NoneType` 没有 `split` 方法
-
-检查 `backend/.env` 是否包含 `ALLOWED_ORIGINS`，并确认从 `backend` 目录启动服务。
-
-### 请求报 CORS 错误
-
-对照浏览器地址与 `ALLOWED_ORIGINS`，确认协议、域名和端口完全匹配。例如 `localhost:3000`、`127.0.0.1:3000` 和 `localhost:3001` 是不同来源。修改配置后重启后端。
-
-### 后端有响应，终端却没有新增请求日志
-
-检查是否同时启动了多套后端，以及正在观察的终端是否属于实际接收请求的进程。
-
-### 升级后出现 `no such column: session_id`
-
-旧版数据库的 `history` 表可能缺少 `session_id` 列。当前初始化代码使用 `CREATE TABLE IF NOT EXISTS`，已有表需要另行迁移。先备份 `backend/history.db`，再处理表结构和旧记录的会话归属。
-
-### 安装 SnowNLP 时出现 `invalid command 'bdist_wheel'`
-
-在 `backend` 目录使用虚拟环境的 Python 安装构建工具，再重试依赖安装。以下 PowerShell 命令适用于本项目已验证的 Python 3.11 环境。
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install --no-cache-dir --disable-pip-version-check wheel==0.45.1
-.\.venv\Scripts\python.exe -m pip install --no-cache-dir --disable-pip-version-check --no-build-isolation -r requirements.txt
+```bash
+npm install
+cp .env.example .env.production   # 按下面「配置说明」填好（线上留空）
+npm run build                     # 产物进 out/，由 Nginx 提供服务
 ```
 
-Linux / macOS 下将 `.\.venv\Scripts\python.exe` 替换为 `.venv/bin/python`。`--no-build-isolation` 会使用当前虚拟环境的构建依赖，因此需先完成构建工具安装。
+**3. 后端：建环境、装依赖、写配置**
+
+```bash
+cd backend
+python3 -m venv --prompt=zero-to-tech .venv   # 首次部署才需要
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env              # 按下面「配置说明」填好
+```
+
+**4. 后端：委托给 systemd**（首次部署才需要）
+
+新建 `/etc/systemd/system/zero-backend.service`：
+
+```ini
+[Unit]
+Description=zero-to-tech backend
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/zero-to-tech/backend
+ExecStart=/home/ubuntu/zero-to-tech/backend/.venv/bin/fastapi run --host 127.0.0.1
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start zero-backend     # 启动
+sudo systemctl enable zero-backend    # 开机自启
+sudo systemctl status zero-backend    # 看到 active (running) 就对了
+```
+
+**5. Nginx：静态文件 ＋ `/api/` 反向代理**（首次部署才需要）
+
+编辑 `/etc/nginx/sites-enabled/default`：
+
+```nginx
+server {
+    listen 80 default_server;
+    server_name _;
+
+    root /home/ubuntu/zero-to-tech/out;
+    index index.html;
+
+    location / {
+        try_files $uri $uri.html $uri/ =404;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000;     # 末尾不要加斜杠
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+**6. 安全组 / 防火墙**
+
+只放行 **22（SSH）** 和 **80（HTTP）**。**8000 不要放行**——后端只监听 `127.0.0.1`，由 Nginx 转发进去。
+
+**7. 验证**
+
+```bash
+curl localhost/api/profile        # 服务器本机，注意不带端口
+```
+
+浏览器访问 `http://服务器IP`，做一次分析、看一眼历史记录。换个无痕窗口再试，两边的历史应该互相看不到。
+
+## 日常发布
+
+```bash
+cd ~/zero-to-tech
+git pull
+
+npm run build                          # 前端改了才需要
+sudo systemctl restart zero-backend    # 后端改了才需要
+```
+
+## 常用运维命令
+
+```bash
+sudo systemctl status zero-backend     # 看状态
+sudo systemctl restart zero-backend    # 重启
+sudo systemctl stop zero-backend       # 停掉
+journalctl -u zero-backend -f          # 实时看日志（Ctrl+C 退出）
+journalctl -u zero-backend -n 50       # 看最后 50 行
+
+sudo nginx -t                          # 改完 Nginx 配置先验语法
+sudo systemctl reload nginx            # 再让它重读
+```
 
 ## 提交到 GitHub
 
